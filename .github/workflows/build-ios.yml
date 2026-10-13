@@ -160,7 +160,7 @@ jobs:
           test -s "$app/Runner"
           test -s "$app/Frameworks/App.framework/App"
           test -s "$app/Frameworks/Flutter.framework/Flutter"
-          xcrun lipo -verify_arch arm64 "$app/Runner"
+          xcrun lipo "$app/Runner" -verify_arch arm64
           xcrun vtool -show-build "$app/Runner" | tee ios-device-info.txt
           grep -Eq 'platform[[:space:]]+IOS([[:space:]]|$)' ios-device-info.txt
           plutil -lint "$app/Info.plist"
