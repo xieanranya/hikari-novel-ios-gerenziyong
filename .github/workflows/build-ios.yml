@@ -1,4 +1,4 @@
-name: Build Hikari Novel iOS IPA
+name: Build Hikari Novel iOS IPA (login fix)
 
 on:
   workflow_dispatch:
@@ -33,172 +33,64 @@ jobs:
           path: source
           persist-credentials: false
 
-      - name: Select Xcode
+      - name: Apply iOS login compatibility fixes
         run: |
           set -euo pipefail
-          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          pod --version
-
-      - name: Install author's Flutter version
-        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
-        with:
-          channel: stable
-          flutter-version: '3.47.4'
-
-      - name: Prepare iOS project
-        run: |
-          set -euo pipefail
-          flutter config --no-enable-swift-package-manager
-          flutter precache --ios
           python3 - <<'PY'
-          import os
-          import plistlib
-          import re
-          from pathlib import Path
-
-          # Keep the exact dependency versions and archive hashes from upstream.
-          lock = Path('pubspec.lock')
-          lock.write_text(lock.read_text().replace(
-              'https://pub.flutter-io.cn', 'https://pub.dev'))
-
-          # iOS version strings cannot include the upstream beta suffix.
-          spec = Path('pubspec.yaml').read_text()
-          version = re.search(r'^version:\s*([^\s]+)', spec, re.M).group(1)
-          build_name = version.split('+')[0].split('-')[0]
-          build_number = version.split('+')[1] if '+' in version else '1'
-          if not re.fullmatch(r'\d+\.\d+\.\d+', build_name):
-              raise SystemExit('Invalid iOS build name: ' + build_name)
-          if not re.fullmatch(r'\d+', build_number):
-              raise SystemExit('Invalid iOS build number: ' + build_number)
-          with open(os.environ['GITHUB_ENV'], 'a') as env:
-              env.write('HIKARI_BUILD_NAME=' + build_name + '\n')
-              env.write('HIKARI_BUILD_NUMBER=' + build_number + '\n')
-
-          # Flutter 3.47.4's CocoaPods template uses iOS 15 as its baseline.
-          project = Path('ios/Runner.xcodeproj/project.pbxproj')
-          project.write_text(re.sub(
-              r'IPHONEOS_DEPLOYMENT_TARGET = [^;]+;',
-              'IPHONEOS_DEPLOYMENT_TARGET = 15.0;', project.read_text()))
-          framework = Path('ios/Flutter/AppFrameworkInfo.plist')
-          info = plistlib.loads(framework.read_bytes())
-          info['MinimumOSVersion'] = '15.0'
-          framework.write_bytes(plistlib.dumps(info, sort_keys=False))
-
-          for configuration in ('Debug', 'Release'):
-              config = Path('ios/Flutter/' + configuration + '.xcconfig')
-              include = ('#include? "Pods/Target Support Files/Pods-Runner/'
-                         'Pods-Runner.' + configuration.lower() + '.xcconfig"\n')
-              contents = config.read_text()
-              if include not in contents:
-                  config.write_text(include + contents)
-
-          # Based on Flutter 3.47.4's packages/flutter_tools/templates/cocoapods/Podfile-ios.
-          Path('ios/Podfile').write_text('''platform :ios, '15.0'
-          ENV['COCOAPODS_DISABLE_STATS'] = 'true'
-          project 'Runner', {
-            'Debug' => :debug,
-            'Profile' => :release,
-            'Release' => :release,
-          }
-          def flutter_root
-            generated = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
-            raise "Run flutter pub get first" unless File.exist?(generated)
-            File.foreach(generated) do |line|
-              matches = line.match(/FLUTTER_ROOT\\=(.*)/)
-              return matches[1].strip if matches
-            end
-            raise "FLUTTER_ROOT not found in Generated.xcconfig"
-          end
-          require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
-          flutter_ios_podfile_setup
-          target 'Runner' do
-            use_frameworks!
-            flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
-            target 'RunnerTests' do
-              inherit! :search_paths
-            end
-          end
-          post_install do |installer|
-            installer.pods_project.targets.each do |target|
-              flutter_additional_ios_build_settings(target)
-              target.build_configurations.each do |config|
-                config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
-                version = config.build_settings['IPHONEOS_DEPLOYMENT_TARGET']
-                if version && Gem::Version.new(version) < Gem::Version.new('15.0')
-                  config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
-                end
-              end
-            end
-          end
-          ''')
-          print('Prepared iOS', build_name, 'build', build_number)
-          PY
-
-      - name: Restore dependencies and generated code
-        run: |
-          set -euo pipefail
-          flutter pub get --enforce-lockfile
-          dart run build_runner build --delete-conflicting-outputs
-
-      - name: Check Dart source
-        run: flutter analyze lib --no-fatal-infos --no-fatal-warnings
-
-      - name: Build for iPhone and iPad
-        run: |
-          set -euo pipefail
-          flutter build ios --release --no-codesign --no-pub \
-            --build-name "$HIKARI_BUILD_NAME" \
-            --build-number "$HIKARI_BUILD_NUMBER" \
-            2>&1 | tee ios-build.log
-
-      - name: Verify device build and package IPA
-        run: |
-          set -euo pipefail
-          app="build/ios/iphoneos/Runner.app"
-          test -s "$app/Runner"
-          test -s "$app/Frameworks/App.framework/App"
-          test -s "$app/Frameworks/Flutter.framework/Flutter"
-          xcrun lipo "$app/Runner" -verify_arch arm64
-          xcrun vtool -show-build "$app/Runner" | tee ios-device-info.txt
-          grep -Eq 'platform[[:space:]]+IOS([[:space:]]|$)' ios-device-info.txt
-          plutil -lint "$app/Info.plist"
-          mkdir -p build/ios/ipa-stage/Payload build/ios/ipa
-          ditto "$app" build/ios/ipa-stage/Payload/Runner.app
-          (
-            cd build/ios/ipa-stage
-            zip -q -r -y ../ipa/HikariNovel-unsigned.ipa Payload
-          )
-          unzip -t build/ios/ipa/HikariNovel-unsigned.ipa | tail -n 1
-          shasum -a 256 build/ios/ipa/HikariNovel-unsigned.ipa > build/ios/ipa/SHA256.txt
-          {
-            git rev-parse HEAD
-            flutter --version
-            xcodebuild -version
-            printf 'iOS build version: %s+%s\n' "$HIKARI_BUILD_NAME" "$HIKARI_BUILD_NUMBER"
-            printf 'Minimum iOS: 15.0\nSigning: unsigned; sign before installation\n'
-            cat ios-device-info.txt
-          } > build/ios/ipa/build-info.txt
-
-      - name: Save IPA for personal signing
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: HikariNovel-iOS-unsigned
-          path: source/build/ios/ipa/*
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
-
-      - name: Save build diagnostics on failure
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: HikariNovel-iOS-build-logs
-          path: |
-            source/ios-build.log
-            source/ios-device-info.txt
-            source/pubspec.lock
-            source/ios/Podfile.lock
-          if-no-files-found: ignore
-          retention-days: 7
+          import subprocess
+          patch = r'''diff --git a/lib/common/app_translations.dart b/lib/common/app_translations.dart
+          index bbf8a64..bcd0b32 100644
+          --- a/lib/common/app_translations.dart
+          +++ b/lib/common/app_translations.dart
+          @@ -249,7 +249,7 @@ class AppTranslations extends Translations {
+                 "no_new_version_available": "已经是最新版本了",
+                 "mark_as_read": "标为已读",
+                 "mark_as_unread": "标为未读",
+          -      "cloudflare_challenge_exception_tip": "当前请求已被Cloudflare的人机验证拦截，这通常是因为你的网络IP不纯净所导致的，请尝试切换其它代理节点，或者关闭代理",
+          +      "cloudflare_challenge_exception_tip": "网站要求完成安全验证，请返回登录页完成验证后重试。若验证一直无法完成，请检查网络连接，或在Safari中确认网站是否可以正常打开。",
+                 "last_read": "上次阅读",
+                 "keyword": "关键词",
+                 "search": "搜索",
+          @@ -285,7 +285,7 @@ class AppTranslations extends Translations {
+                 "chapter_content_loading_tip": "当前章节还在加载中",
+                 "copy_all": "复制全部",
+                 "free_copy": "自由复制",
+          -      "cloudflare_403_exception_tip": "你的IP已被Cloudflare拒绝访问，请使用其他IP进行访问",
+          +      "cloudflare_403_exception_tip": "网站拒绝了此请求（HTTP 403）。这不一定表示IP被封禁，请确认登录状态及网站访问权限后重试。",
+                 "open_source_license": "开源许可",
+                 "para_indent": "首行缩进",
+                 "para_spacing": "段距",
+          @@ -538,7 +538,7 @@ class AppTranslations extends Translations {
+                 "no_new_version_available": "已是最新版本",
+                 "mark_as_read": "標為已讀",
+                 "mark_as_unread": "標為未讀",
+          -      "cloudflare_challenge_exception_tip": "當前請求已被Cloudflare的人機驗證攔截，這通常是因為你的網路IP不純淨所導致的，請嘗試切換其它代理節點，或者關閉代理",
+          +      "cloudflare_challenge_exception_tip": "網站要求完成安全驗證，請返回登入頁完成驗證後重試。若驗證一直無法完成，請檢查網路連線，或在Safari中確認網站是否可以正常開啟。",
+                 "last_read": "上次閱讀",
+                 "keyword": "關鍵詞",
+                 "search": "搜尋",
+          @@ -574,7 +574,7 @@ class AppTranslations extends Translations {
+                 "chapter_content_loading_tip": "目前章節仍在載入中",
+                 "copy_all": "複製全部",
+                 "free_copy": "自由複製",
+          -      "cloudflare_403_exception_tip": "你的IP已被Cloudflare拒絕訪問，請使用其他IP進行訪問",
+          +      "cloudflare_403_exception_tip": "網站拒絕了此請求（HTTP 403）。這不一定表示IP被封鎖，請確認登入狀態及網站存取權限後重試。",
+                 "open_source_license": "開源許可",
+                 "para_indent": "首行縮進",
+                 "para_spacing": "段距",
+          diff --git a/lib/common/constants.dart b/lib/common/constants.dart
+          index d118f4a..1928092 100644
+          --- a/lib/common/constants.dart
+          +++ b/lib/common/constants.dart
+          @@ -5,7 +5,7 @@ const String kAppName = "Hikari Novel";
+           
+           const String kLatestUrl = "https://api.github.com/repos/15dd/hikari_novel_flutter/releases/latest";
+           
+          -const Map<String, String> kUserAgent = {
+          +final Map<String, String> kUserAgent = {
+             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0",
+           };
+           
+          diff --git a/lib/main.dart b/lib/main.dart
+          index 92a7a51..a495a06 100644
+          --- a/lib/main.dart
