@@ -1,0 +1,204 @@
+name: Build Hikari Novel iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Upstream source commit (default: inspected main version)'
+        required: true
+        default: 'a9e579a0e2ce8b59a5ec401798110e1de5a37b5c'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      PUB_HOSTED_URL: https://pub.dev
+      COCOAPODS_DISABLE_STATS: 'true'
+
+    steps:
+      - name: Download upstream source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: 15dd/hikari_novel_flutter
+          ref: ${{ inputs.source_ref }}
+          path: source
+          persist-credentials: false
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          pod --version
+
+      - name: Install author's Flutter version
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          flutter-version: '3.47.4'
+
+      - name: Prepare iOS project
+        run: |
+          set -euo pipefail
+          flutter config --no-enable-swift-package-manager
+          flutter precache --ios
+          python3 - <<'PY'
+          import os
+          import plistlib
+          import re
+          from pathlib import Path
+
+          # Keep the exact dependency versions and archive hashes from upstream.
+          lock = Path('pubspec.lock')
+          lock.write_text(lock.read_text().replace(
+              'https://pub.flutter-io.cn', 'https://pub.dev'))
+
+          # iOS version strings cannot include the upstream beta suffix.
+          spec = Path('pubspec.yaml').read_text()
+          version = re.search(r'^version:\s*([^\s]+)', spec, re.M).group(1)
+          build_name = version.split('+')[0].split('-')[0]
+          build_number = version.split('+')[1] if '+' in version else '1'
+          if not re.fullmatch(r'\d+\.\d+\.\d+', build_name):
+              raise SystemExit('Invalid iOS build name: ' + build_name)
+          if not re.fullmatch(r'\d+', build_number):
+              raise SystemExit('Invalid iOS build number: ' + build_number)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('HIKARI_BUILD_NAME=' + build_name + '\n')
+              env.write('HIKARI_BUILD_NUMBER=' + build_number + '\n')
+
+          # Flutter 3.47.4's CocoaPods template uses iOS 15 as its baseline.
+          project = Path('ios/Runner.xcodeproj/project.pbxproj')
+          project.write_text(re.sub(
+              r'IPHONEOS_DEPLOYMENT_TARGET = [^;]+;',
+              'IPHONEOS_DEPLOYMENT_TARGET = 15.0;', project.read_text()))
+          framework = Path('ios/Flutter/AppFrameworkInfo.plist')
+          info = plistlib.loads(framework.read_bytes())
+          info['MinimumOSVersion'] = '15.0'
+          framework.write_bytes(plistlib.dumps(info, sort_keys=False))
+
+          for configuration in ('Debug', 'Release'):
+              config = Path('ios/Flutter/' + configuration + '.xcconfig')
+              include = ('#include? "Pods/Target Support Files/Pods-Runner/'
+                         'Pods-Runner.' + configuration.lower() + '.xcconfig"\n')
+              contents = config.read_text()
+              if include not in contents:
+                  config.write_text(include + contents)
+
+          # Based on Flutter 3.47.4's packages/flutter_tools/templates/cocoapods/Podfile-ios.
+          Path('ios/Podfile').write_text('''platform :ios, '15.0'
+          ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+          project 'Runner', {
+            'Debug' => :debug,
+            'Profile' => :release,
+            'Release' => :release,
+          }
+          def flutter_root
+            generated = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+            raise "Run flutter pub get first" unless File.exist?(generated)
+            File.foreach(generated) do |line|
+              matches = line.match(/FLUTTER_ROOT\\=(.*)/)
+              return matches[1].strip if matches
+            end
+            raise "FLUTTER_ROOT not found in Generated.xcconfig"
+          end
+          require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+          flutter_ios_podfile_setup
+          target 'Runner' do
+            use_frameworks!
+            flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+            target 'RunnerTests' do
+              inherit! :search_paths
+            end
+          end
+          post_install do |installer|
+            installer.pods_project.targets.each do |target|
+              flutter_additional_ios_build_settings(target)
+              target.build_configurations.each do |config|
+                config.build_settings['CODE_SIGNING_ALLOWED'] = 'NO'
+                version = config.build_settings['IPHONEOS_DEPLOYMENT_TARGET']
+                if version && Gem::Version.new(version) < Gem::Version.new('15.0')
+                  config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+                end
+              end
+            end
+          end
+          ''')
+          print('Prepared iOS', build_name, 'build', build_number)
+          PY
+
+      - name: Restore dependencies and generated code
+        run: |
+          set -euo pipefail
+          flutter pub get --enforce-lockfile
+          dart run build_runner build --delete-conflicting-outputs
+
+      - name: Check Dart source
+        run: flutter analyze lib --no-fatal-infos --no-fatal-warnings
+
+      - name: Build for iPhone and iPad
+        run: |
+          set -euo pipefail
+          flutter build ios --release --no-codesign --no-pub \
+            --build-name "$HIKARI_BUILD_NAME" \
+            --build-number "$HIKARI_BUILD_NUMBER" \
+            2>&1 | tee ios-build.log
+
+      - name: Verify device build and package IPA
+        run: |
+          set -euo pipefail
+          app="build/ios/iphoneos/Runner.app"
+          test -s "$app/Runner"
+          test -s "$app/Frameworks/App.framework/App"
+          test -s "$app/Frameworks/Flutter.framework/Flutter"
+          xcrun lipo -verify_arch arm64 "$app/Runner"
+          xcrun vtool -show-build "$app/Runner" | tee ios-device-info.txt
+          grep -Eq 'platform[[:space:]]+IOS([[:space:]]|$)' ios-device-info.txt
+          plutil -lint "$app/Info.plist"
+          mkdir -p build/ios/ipa-stage/Payload build/ios/ipa
+          ditto "$app" build/ios/ipa-stage/Payload/Runner.app
+          (
+            cd build/ios/ipa-stage
+            zip -q -r -y ../ipa/HikariNovel-unsigned.ipa Payload
+          )
+          unzip -t build/ios/ipa/HikariNovel-unsigned.ipa | tail -n 1
+          shasum -a 256 build/ios/ipa/HikariNovel-unsigned.ipa > build/ios/ipa/SHA256.txt
+          {
+            git rev-parse HEAD
+            flutter --version
+            xcodebuild -version
+            printf 'iOS build version: %s+%s\n' "$HIKARI_BUILD_NAME" "$HIKARI_BUILD_NUMBER"
+            printf 'Minimum iOS: 15.0\nSigning: unsigned; sign before installation\n'
+            cat ios-device-info.txt
+          } > build/ios/ipa/build-info.txt
+
+      - name: Save IPA for personal signing
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: HikariNovel-iOS-unsigned
+          path: source/build/ios/ipa/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Save build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: HikariNovel-iOS-build-logs
+          path: |
+            source/ios-build.log
+            source/ios-device-info.txt
+            source/pubspec.lock
+            source/ios/Podfile.lock
+          if-no-files-found: ignore
+          retention-days: 7
