@@ -1,6 +1,8 @@
 name: Build Hikari Novel iOS IPA (reading fix v5)
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       source_ref:
@@ -210,6 +212,20 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+      - name: 发布到 Releases（发行作品）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-build-${{ github.run_number }}
+          name: Hikari Novel iOS #${{ github.run_number }}
+          body: |
+            自动构建的 iOS 未签名安装包（光小说 Hikari Novel）。
+
+            - 产物：IPA（未签名，需用 Sideloadly / AltStore 等工具签名后安装）
+            - 流水线：第 ${{ github.run_number }} 次构建
+          files: source/build/ios/ipa/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Save build diagnostics on failure
         if: failure()
